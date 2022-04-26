@@ -67,6 +67,18 @@ __thread u32 __afl_prev_loc;
 
 static u8 is_persistent;
 
+/* Globals to record the count of basic block */
+
+u32 __blk_area_initial[MAP_SIZE];
+u32* __blk_area_ptr = __blk_area_initial;
+
+void __trace_basic_blk(u32 blk_id) {
+
+  if (__blk_area_ptr[blk_id] < UINT32_MAX)
+    __blk_area_ptr[blk_id]++;
+
+}
+
 
 /* SHM setup. */
 
@@ -93,6 +105,17 @@ static void __afl_map_shm(void) {
 
     __afl_area_ptr[0] = 1;
 
+  }
+
+  id_str = getenv(BB_SHM_ENV);
+
+  if (id_str) {
+    
+    u32 shm_id = atoi(id_str);
+
+    __blk_area_ptr = shmat(shm_id, NULL, 0);
+
+    if (__blk_area_ptr == (void *)-1) _exit(1);
   }
 
 }

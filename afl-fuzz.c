@@ -157,6 +157,9 @@ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
 static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
 
 static s32 shm_id;                    /* ID of the SHM region             */
+static s32 bb_shm_id;                 /* ID of the Basic block region     */
+
+EXP_ST u32* basic_blk_cov;            /* SHM with bitmap for block hits   */
 
 static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
                    clear_screen = 1,  /* Window resized?                  */
@@ -876,6 +879,18 @@ EXP_ST void write_bitmap(void) {
   ck_write(fd, virgin_bits, MAP_SIZE, fname);
 
   close(fd);
+
+  /* Save the basic block bitmap */
+
+  fname = alloc_printf("%s/bb_bitmap", out_dir);
+  fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+  if (fd < 0) PFATAL("Unable to open '%s'", fname);
+
+  ck_write(fd, basic_blk_cov, sizeof(u32) * MAP_SIZE, fname);
+
+  close(fd);
+
   ck_free(fname);
 
 }
@@ -1231,6 +1246,8 @@ static void remove_shm(void) {
 
   shmctl(shm_id, IPC_RMID, NULL);
 
+  shmctl(bb_shm_id, IPC_RMID, NULL);
+
 }
 
 
@@ -1371,6 +1388,7 @@ static void cull_queue(void) {
 EXP_ST void setup_shm(void) {
 
   u8* shm_str;
+  u8* bb_shm_str;
 
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
@@ -1381,20 +1399,32 @@ EXP_ST void setup_shm(void) {
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
+  bb_shm_id = shmget(IPC_PRIVATE, sizeof(u32) * MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+
+  if (bb_shm_id < 0) PFATAL("shmget() failed for basic block");
+
   atexit(remove_shm);
 
   shm_str = alloc_printf("%d", shm_id);
+  bb_shm_str = alloc_printf("%d", bb_shm_id);
 
   /* If somebody is asking us to fuzz instrumented binaries in dumb mode,
      we don't want them to detect instrumentation, since we won't be sending
      fork server commands. This should be replaced with better auto-detection
      later on, perhaps? */
 
-  if (!dumb_mode) setenv(SHM_ENV_VAR, shm_str, 1);
+  if (!dumb_mode) {
+    setenv(SHM_ENV_VAR, shm_str, 1);
+    setenv(BB_SHM_ENV, bb_shm_str, 1);
+  }
 
   ck_free(shm_str);
+  ck_free(bb_shm_str);
 
   trace_bits = shmat(shm_id, NULL, 0);
+  basic_blk_cov = shmat(bb_shm_id, NULL, 0);
+
+  memset(basic_blk_cov, 0, sizeof(u32) * MAP_SIZE);
   
   if (trace_bits == (void *)-1) PFATAL("shmat() failed");
 

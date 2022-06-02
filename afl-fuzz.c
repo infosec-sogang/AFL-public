@@ -253,7 +253,8 @@ struct queue_entry {
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
       favored,                        /* Currently favored?               */
-      fs_redundant;                   /* Marked as redundant in the fs?   */
+      fs_redundant,                   /* Marked as redundant in the fs?   */
+      synced;                         /* Sync from other queues?          */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
       exec_cksum;                     /* Checksum of the execution trace  */
@@ -804,7 +805,7 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 /* Append new test case to the queue. */
 
-static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
+static void add_to_queue(u8* fname, u32 len, u8 passed_det, u8 synced) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
@@ -812,6 +813,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+  q->synced       = synced;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1348,7 +1350,7 @@ static void cull_queue(void) {
   q = queue;
 
   while (q) {
-    q->favored = 0;
+    if (q->synced) q->favored=1; else q->favored = 0;
     q = q->next;
   }
 
@@ -1538,7 +1540,7 @@ static void read_testcases(void) {
     if (!access(dfn, F_OK)) passed_det = 1;
     ck_free(dfn);
 
-    add_to_queue(fn, st.st_size, passed_det);
+    add_to_queue(fn, st.st_size, passed_det, 0);
 
   }
 
@@ -3190,7 +3192,7 @@ static void write_crash_readme(void) {
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
-static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault, u8 synced) {
 
   u8  *fn = "";
   u8  hnb;
@@ -3218,7 +3220,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 #endif /* ^!SIMPLE_FILES */
 
-    add_to_queue(fn, len, 0);
+    add_to_queue(fn, len, 0, synced);
 
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
@@ -4716,7 +4718,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   /* This handles FAULT_ERROR for us: */
 
-  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+  queued_discovered += save_if_interesting(argv, out_buf, len, fault, 0);
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
@@ -6175,6 +6177,8 @@ havoc_stage:
 
   if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
 
+  if (queue->synced) stage_max *= 2;
+
   temp_len = len;
 
   orig_hit_cnt = queued_paths + unique_crashes;
@@ -6188,11 +6192,16 @@ havoc_stage:
 
     u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
 
+    u32 mutate_type = UR(HAVOC_MUTATE_TYPE);
+
     stage_cur_val = use_stacking;
  
     for (i = 0; i < use_stacking; i++) {
 
-      switch (UR(15 + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
+      if (mutate_type) {
+        
+        /* Unit mutator */
+        switch (UR(11)) {
 
         case 0:
 
@@ -6366,6 +6375,13 @@ havoc_stage:
 
           out_buf[UR(temp_len)] ^= 1 + UR(255);
           break;
+
+        }
+
+      } else {
+        
+        /* Chunk mutator */
+        switch (11 + UR(4 + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
 
         case 11 ... 12: {
 
@@ -6560,6 +6576,7 @@ havoc_stage:
 
           }
 
+        }
       }
 
     }
@@ -6597,7 +6614,7 @@ havoc_stage:
     stage_cycles[STAGE_HAVOC] += stage_max;
   } else {
     stage_finds[STAGE_SPLICE]  += new_hit_cnt - orig_hit_cnt;
-    stage_cycles[STAGE_SPLICE] += stage_max;
+    stage_cycles[STAGE_SPLICE] += stage_max; 
   }
 
 #ifndef IGNORE_FINDS
@@ -6830,7 +6847,7 @@ static void sync_fuzzers(char** argv) {
         if (stop_soon) return;
 
         syncing_party = sd_ent->d_name;
-        queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+        queued_imported += save_if_interesting(argv, mem, st.st_size, fault, 1);
         syncing_party = 0;
 
         munmap(mem, st.st_size);

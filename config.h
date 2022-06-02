@@ -111,6 +111,8 @@
 
 #define HAVOC_STACK_POW2    7
 
+#define HAVOC_MUTATE_TYPE   2
+
 /* Caps on block sizes for cloning and deletion operations. Each of these
    ranges has a 33% probability of getting picked, except for the first
    two cycles where smaller blocks are favored: */

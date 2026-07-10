@@ -89,7 +89,19 @@
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
+  
+#define BITS_PER_BYTE 8
+#define BITMAP_BYTES(nbits) (((nbits) + 7) / 8)
+#define IS_PROTECTED(masking, byte_pos) \
+  ((byte_pos) < (len) && \
+  ((masking[(byte_pos) / 8] & (1 << ((byte_pos) % 8))) != 0))
 
+static u8   tracking_cov_seed  = 0;       /* 현재 +cov seed를 fuzz 중인가?     */
+static u32* tracking_cov_idxs  = NULL;    /* 추적 중인 bitmap index 목록       */
+static u32  tracking_cov_cnt   = 0;       /* 목록 크기                         */
+static struct queue_entry* tracking_cov_entry = NULL;  /* 추적 중인 entry */
+static u64  mutant_hit_cnt  = 0;
+static u64  mutant_miss_cnt = 0;
 
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
@@ -136,7 +148,10 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
            deferred_mode,             /* Deferred forkserver mode?        */
-           fast_cal;                  /* Try to calibrate faster?         */
+           fast_cal,                  /* Try to calibrate faster?         */
+           offset_mut_prob,           /* set by AFL_OFFSET_MUT_PROB       */
+           offset_target_dev,         /* how much to concentrate at taget */
+           random_stage_ratio;        /* % of total budget for random_stage (AFL_RANDOM_STAGE_RATIO) */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -241,7 +256,19 @@ static FILE* plot_file;               /* Gnuplot output file              */
 struct queue_entry {
 
   u8* fname;                          /* File name for the test case      */
-  u32 len;                            /* Input length                     */
+
+  u8* masking;                        /* Offset data for fine-grain fuzz  */
+  u32* target_index;                  /* latest masking index             */
+  u32 masking_len;                    /* Length of masking offset         */
+
+  u32 len,                            /* Input length                     */
+      selection_cnt,                  /* Selection counting               */  // hfuzz : for check test counting
+      mutation_cnt,                   /* Mutation counting                */  // hfuzz : for check mutation counting
+      num_target_indices;             /* Target index counting            */
+
+  u8   imported_with_cov;             /* sync import 시 +cov였는가?         */
+  u32* cov_indices;                   /* import 시 새로 열린 bitmap index 목록*/
+  u32  cov_indices_cnt;               /* 위 목록의 크기                      */
 
   u8  cal_failed,                     /* Calibration failed?              */
       trim_done,                      /* Trimmed?                         */
@@ -798,6 +825,230 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
+static void init_offset_hyperparams(void) {
+  char* p = getenv("AFL_OFFSET_MUT_PROB");
+  if (p) {
+    offset_mut_prob = atoi(p);
+    if (offset_mut_prob > 100) offset_mut_prob = 100;
+  }
+  else
+    SAYF("You have to set AFL_OFFSET_MUT_PROB");
+
+  p = getenv("AFL_OFFSET_DEV");
+  if (p) {
+    offset_target_dev = atoi(p);
+    if (offset_target_dev > 100) offset_target_dev = 100;
+  }
+  else
+    SAYF("You have to set AFL_OFFSET_DEV");
+
+  p = getenv("AFL_RANDOM_STAGE_RATIO");
+  if (p) {
+    random_stage_ratio = atoi(p);
+    if (random_stage_ratio > 100) random_stage_ratio = 100;
+  } else {
+    random_stage_ratio = 50;
+  }
+}
+
+static void write_mutant_cov_stats(const u8* seed_fname, u32* indices, u32 idx_cnt, u64 hit, u64 miss) {
+  u8 csv_path[PATH_MAX];
+  snprintf(csv_path, PATH_MAX, "%s/mutant_cov_stats.csv", out_dir);
+
+  u8 is_new = access((char*)csv_path, F_OK);  /* 파일 없으면 -1 */
+
+  FILE* f = fopen((char*)csv_path, "a");
+  if (!f) return;
+
+  if (is_new)
+    fprintf(f, "elapsed_sec,seed_fname,tracked_indices,total_mutants,hit,miss,hit_rate\n");
+
+  /* tracked_indices를 "134|135|..." 형식으로 직렬화 */
+  u8 idx_str[1024] = {0};
+  u32 off = 0;
+  for (u32 i = 0; i < idx_cnt && off < sizeof(idx_str) - 16; i++)
+    off += snprintf((char*)idx_str + off, sizeof(idx_str) - off, i ? "|%u" : "%u", indices[i]);
+
+  u64 elapsed_sec = (get_cur_time() - start_time) / 1000;
+  u64 total = hit + miss;
+  fprintf(f, "%llu,\"%s\",\"%s\",%llu,%llu,%llu,%.4f\n",
+    elapsed_sec, seed_fname, idx_str, total, hit, miss,
+    total ? (double)hit / total : 0.0);
+
+  fclose(f);
+}
+
+/* seed가 탐색한 bitmap 대비 random_stage mutant들의 union bitmap 다양성 기록 */
+/* stage = "random" or "havoc": union bitmap diversity vs seed baseline */
+static void write_stage_cov_stats(const u8* seed_fname,
+                                   u32 random_new, u32 random_mutations,
+                                   u32 havoc_new,  u32 havoc_mutations,
+                                   u32 both, u32 random_only, u32 havoc_only) {
+  u8 csv_path[PATH_MAX];
+  snprintf(csv_path, PATH_MAX, "%s/stage_cov.csv", out_dir);
+
+  u8 is_new = access((char*)csv_path, F_OK);
+
+  FILE* f = fopen((char*)csv_path, "a");
+  if (!f) return;
+
+  if (is_new)
+    fprintf(f, "seed_fname,random_new,random_mutations,havoc_new,havoc_mutations,both,random_only,havoc_only\n");
+
+  fprintf(f, "\"%s\",%u,%u,%u,%u,%u,%u,%u\n",
+          seed_fname,
+          random_new, random_mutations,
+          havoc_new,  havoc_mutations,
+          both, random_only, havoc_only);
+
+  fclose(f);
+}
+
+static u8* extract_orig_from_fname(const u8* fname) {
+
+  const char* p = strstr((const char*)fname, ",src:");
+  if (!p) return NULL;
+
+  p += 5;  // strlen(",src:")
+
+  u8* orig = ck_alloc(7);
+  memcpy(orig, p, 6);
+  orig[6] = '\0';
+
+  return orig;
+}
+
+/* Extract the sync-source directory name from a synced queue entry filename.
+   e.g. "...sync:qsym,src:000042" -> "qsym"
+   Caller must ck_free() the returned string. Returns NULL if not a synced entry. */
+static u8* extract_sync_source(const u8* fname) {
+  const char* p = strstr((const char*)fname, "sync:");
+  if (!p) 
+    return NULL;
+  p += 5; /* skip "sync:" */
+  const char* end = strchr(p, ',');
+  if (!end) 
+    end = p + strlen(p);
+  size_t len = end - p;
+  if (!len) 
+    return NULL;
+  u8* ret = ck_alloc(len + 1);
+  memcpy(ret, p, len);
+  ret[len] = '\0';
+  return ret;
+}
+  
+static char* get_offset_path(const char* fname, const char* source_dir) {
+  static char buf[PATH_MAX];
+  u8* orig = extract_orig_from_fname(fname);
+  if (!orig) return NULL;
+
+  snprintf(buf, sizeof(buf),
+           "%s/../%s/offset/id:%s.meta",
+           out_dir, source_dir, orig);
+
+  ck_free(orig);
+
+  return buf;
+}
+
+static void parse_offset_from_name(struct queue_entry* q, const char* source_dir) {
+  char* offset_path = get_offset_path(q->fname, source_dir);
+
+  int fd = open(offset_path, O_RDONLY);
+  if (fd < 0) {
+    q->masking_len = 0;
+    q->masking = NULL;
+    return;
+  }
+
+  char buf[4096];
+  ssize_t len = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (len <= 0) {
+    q->masking_len = 0;
+    q->masking = NULL;
+    SAYF("masking set to NULL\n");
+    return;
+  }
+
+  char* line1 = strtok(buf, "\n");
+  char* line2 = strtok(NULL, "\n");
+
+  u32 targets[128];
+  u32 num_targets = 0;
+
+  char* tmp_targets = ck_strdup(line1);
+  char* saveptr;
+  char* tok = strtok_r(tmp_targets, ",", &saveptr);
+
+  while (tok && num_targets < 128) {
+    targets[num_targets++] = (u32)atoi(tok);
+    tok = strtok_r(NULL, ",", &saveptr);
+  }
+  ck_free(tmp_targets);
+  q->num_target_indices = num_targets;
+  q->target_index = ck_alloc(sizeof(u32) * num_targets);
+  memcpy(q->target_index, targets, sizeof(u32) * num_targets);
+
+  q->masking_len = BITMAP_BYTES(q->len);
+  q->masking = ck_alloc(q->masking_len);
+  memset(q->masking, 0, q->masking_len);
+
+  char* tmp = ck_strdup(line2);
+  char* chunks[128];
+  int num_chunks = 0;
+
+  char* tok2 = strtok_r(tmp, "_", &saveptr);
+  while (tok2 && num_chunks < 128) {
+    chunks[num_chunks++] = tok2;
+    tok2 = strtok_r(NULL, "_", &saveptr);
+  }
+
+  int bit_base = 0;
+
+  for (int i = num_chunks - 1; i >= 0; i--) {
+    uint64_t mask = strtoull(chunks[i], NULL, 16);
+
+    for (int b = 0; b < 64; b++) {
+      if (mask & (1ULL << b)) {
+        int bit_pos = bit_base + b;
+        if (bit_pos < q->len) {
+          q->masking[bit_pos / 8] |= (1 << (bit_pos % 8));
+        }
+      }
+    }
+    bit_base += 64;
+  }
+
+  ck_free(tmp);
+}
+
+static inline s32 get_modifiable_posn(
+  u8* masking,
+  u32 len,
+  u32* target_index,
+  u32 target_len) {
+
+  s32 center = target_index[UR(target_len)];
+
+  for (u32 dist = 1; dist < len; dist++) {
+
+    s32 left = center - dist;
+    if (left >= 0 && (u32)left < len &&
+        !IS_PROTECTED(masking, left) &&
+        UR(100) >= offset_target_dev)
+      return left;
+
+    s32 right = center + dist;
+    if ((u32)right < len &&
+        !IS_PROTECTED(masking, right) &&
+        UR(100) >= offset_target_dev)
+      return right;
+  }
+
+  return len;
+}
 
 /* Append new test case to the queue. */
 
@@ -809,6 +1060,26 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+
+  u8* sync_source = extract_sync_source(fname);
+  if (sync_source) {
+    /* Only load offset data if the source has an offset/ directory.
+       Concolic tools (qsym, symcc) create it via afl.py make_dirs().
+       Plain AFL instances (master, slave) do not — skip them. */
+    u8* offset_dir = alloc_printf("%s/../%s/offset", out_dir, (char*)sync_source);
+    struct stat _st;
+    if (stat((char*)offset_dir, &_st) == 0 && S_ISDIR(_st.st_mode)) {
+      parse_offset_from_name(q, (const char*)sync_source);
+    } else {
+      q->masking_len = 0;
+      q->masking = NULL;
+    }
+    ck_free(offset_dir);
+    ck_free(sync_source);
+  } else {
+    q->masking_len = 0;
+    q->masking = NULL;
+  }
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -834,6 +1105,38 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   last_path_time = get_cur_time();
 
+  /* Code added to record the exact time of seed generation (using the timestamp
+   * of Linux system yields imprecise result for some seeds in the queue). */
+   char exec_time_path[PATH_MAX] = {0};
+   snprintf(exec_time_path, PATH_MAX, "%s", out_dir); // Use the outdir as the base path
+ 
+   // Append "/tc_birth.csv" to the base path
+   strncat(exec_time_path, "/tc_birth.csv", PATH_MAX - strlen(exec_time_path) - 1);
+ 
+   // Open the file in append mode
+   FILE *fp = fopen(exec_time_path, "a");
+   if (fp == NULL) {
+     printf("Error in opening file: %s\n", exec_time_path);
+     return;
+   }
+ 
+   // Write the data to the file
+   char *queue_pos = strstr(fname, "/queue/");
+   u64 path_time_sec = 0;
+   if (queue_pos) {
+     path_time_sec=last_path_time-start_time;
+   } else {
+    const char* slash = strrchr(fname, '/');  // 다른 이름 사용
+    u8* new_fname = alloc_printf("%s/queue/id:%06u,orig:%s",
+                                  out_dir, queued_paths-1, slash+1);
+    fprintf(fp, "\"%s\",%llu\n", new_fname, path_time_sec/1000);
+    ck_free(new_fname);
+    goto done_birth;
+   }
+   fprintf(fp, "\"%s\",%llu\n", fname, path_time_sec/1000);
+   done_birth:
+   fclose(fp);
+ 
 }
 
 
@@ -848,6 +1151,7 @@ EXP_ST void destroy_queue(void) {
     n = q->next;
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    ck_free(q->cov_indices);
     ck_free(q);
     q = n;
 
@@ -2297,7 +2601,8 @@ static u8 run_target(char** argv, u32 timeout) {
   u32 tb4;
 
   child_timed_out = 0;
-
+  kill_signal = 0;
+  
   /* After this memset, trace_bits[] are effectively volatile, so we
      must prevent any earlier operations from venturing into that
      territory. */
@@ -3155,6 +3460,64 @@ static void write_crash_readme(void) {
 
 }
 
+static u32* extract_new_cov_indices(u8* virgin_map, u32* cnt) {
+
+  u32  capacity = 64;
+  u32* result   = ck_alloc(sizeof(u32) * capacity);
+  u32  found    = 0;
+
+#ifdef WORD_SIZE_64
+  u64* current = (u64*)trace_bits;
+  u64* virgin  = (u64*)virgin_map;
+  u32  words   = MAP_SIZE >> 3;
+  u32  base    = 0;
+
+  for (u32 w = 0; w < words; w++, base += 8) {
+    if (!current[w] || !(current[w] & virgin[w])) continue;
+
+    u8* cur8 = (u8*)(current + w);
+    u8* vir8 = (u8*)(virgin  + w);
+
+    for (u32 b = 0; b < 8; b++) {
+      if (cur8[b] && vir8[b] == 0xff) {
+        if (found == capacity) {
+          capacity <<= 1;
+          result = ck_realloc(result, sizeof(u32) * capacity);
+        }
+        result[found++] = base + b;
+      }
+    }
+  }
+
+#else
+  u32* current = (u32*)trace_bits;
+  u32* virgin  = (u32*)virgin_map;
+  u32  words   = MAP_SIZE >> 2;
+  u32  base    = 0;
+
+  for (u32 w = 0; w < words; w++, base += 4) {
+    if (!current[w] || !(current[w] & virgin[w])) continue;
+
+    u8* cur8 = (u8*)(current + w);
+    u8* vir8 = (u8*)(virgin  + w);
+
+    for (u32 b = 0; b < 4; b++) {
+      if (cur8[b] && vir8[b] == 0xff) {
+        if (found == capacity) {
+          capacity <<= 1;
+          result = ck_realloc(result, sizeof(u32) * capacity);
+        }
+        result[found++] = base + b;
+      }
+    }
+  }
+#endif
+
+  *cnt = found;
+  if (!found) { ck_free(result); return NULL; }
+  return result;
+
+}
 
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
@@ -3172,6 +3535,10 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
+    static u8 virgin_snap[MAP_SIZE];
+    if (syncing_party)
+      memcpy(virgin_snap, virgin_bits, MAP_SIZE);
+    
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
       return 0;
@@ -3193,6 +3560,23 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
       queued_with_cov++;
+
+      if (syncing_party) {
+        if (strncmp((char*)syncing_party, "master", 6) != 0) {
+
+          queue_top->imported_with_cov = 1;
+
+          queue_top->cov_indices = extract_new_cov_indices(virgin_snap,
+                                     &queue_top->cov_indices_cnt);
+
+          SAYF("[+cov import] seed: %s\n"
+               "             newly covered bitmap indices (%u): ",
+               fn, queue_top->cov_indices_cnt);
+          for (u32 i = 0; i < queue_top->cov_indices_cnt; i++)
+            SAYF("%u ", queue_top->cov_indices[i]);
+          SAYF("\n");
+        }
+      }
     }
 
     queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
@@ -4687,6 +5071,74 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   /* This handles FAULT_ERROR for us: */
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+  /* ── +cov index hit 판정 ── */
+  if (tracking_cov_seed && tracking_cov_idxs && tracking_cov_cnt > 0) {
+    u8 hit = 0;
+    for (u32 i = 0; i < tracking_cov_cnt; i++) {
+      if (trace_bits[tracking_cov_idxs[i]]) { hit = 1; break; }
+    }
+    if (hit) mutant_hit_cnt++;
+    else     mutant_miss_cnt++;
+  }
+  /* ─────────────────────────── */
+  if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
+    show_stats();
+
+  return 0;
+
+}
+
+EXP_ST u8 common_fuzz_stuff_fine_grained(char** argv, u8* out_buf, u32 len) {
+
+  u8 fault;
+
+  if (post_handler) {
+
+    out_buf = post_handler(out_buf, &len);
+    if (!out_buf || !len) return 0;
+
+  }
+
+  write_to_testcase(out_buf, len);
+
+  fault = run_target(argv, exec_tmout);
+
+  if (stop_soon) return 1;
+
+  if (fault == FAULT_TMOUT) {
+
+    if (subseq_tmouts++ > TMOUT_LIMIT) {
+      cur_skipped_paths++;
+      return 1;
+    }
+
+  } else subseq_tmouts = 0;
+
+  /* Users can hit us with SIGUSR1 to request the current input
+     to be abandoned. */
+
+  if (skip_requested) {
+
+     skip_requested = 0;
+     cur_skipped_paths++;
+     return 1;
+
+  }
+
+  /* This handles FAULT_ERROR for us: */
+
+  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+
+  /* ── +cov index hit 판정 ── */
+  if (tracking_cov_seed && tracking_cov_idxs && tracking_cov_cnt > 0) {
+    u8 hit = 0;
+    for (u32 i = 0; i < tracking_cov_cnt; i++) {
+      if (trace_bits[tracking_cov_idxs[i]]) { hit = 1; break; }
+    }
+    if (hit) mutant_hit_cnt++;
+    else     mutant_miss_cnt++;
+  }
+  /* ─────────────────────────── */
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
@@ -5008,6 +5460,12 @@ static u8 fuzz_one(char** argv) {
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
 
   u8  ret_val = 1, doing_det = 0;
+  s32 random_stage_havoc_max = -1;
+  u8* cov_seed_trace      = NULL;  /* baseline trace for +cov imported seeds  */
+  u8* havoc_union_map     = NULL;  /* union of havoc mutant traces            */
+  u8* random_union_map    = NULL;  /* union of random mutant traces           */
+  u32 random_stage_mutations = 0;  /* stage_max saved from random_stage       */
+  u8 random_stage_ran = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
@@ -5070,6 +5528,18 @@ static u8 fuzz_one(char** argv) {
 
   close(fd);
 
+  if (queue_cur->imported_with_cov && queue_cur->cov_indices_cnt > 0) {
+    if (tracking_cov_entry != queue_cur) {
+      tracking_cov_entry = queue_cur;
+      mutant_hit_cnt     = 0;
+      mutant_miss_cnt    = 0;
+    }
+    tracking_cov_seed = 1;
+    tracking_cov_idxs = queue_cur->cov_indices;
+    tracking_cov_cnt  = queue_cur->cov_indices_cnt;
+  } 
+  else
+    tracking_cov_seed = 0;
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
@@ -5141,6 +5611,19 @@ static u8 fuzz_one(char** argv) {
    *********************/
 
   orig_perf = perf_score = calculate_score(queue_cur);
+
+  /* For +cov imported seeds, capture the seed's own trace ONCE here so that
+     both random_stage and havoc_stage can reference the same baseline when
+     measuring union-bitmap diversity. */
+  if (queue_cur->imported_with_cov) {
+    write_to_testcase(in_buf, len);
+    run_target(argv, exec_tmout);
+    u32 seed_hit = count_bytes(trace_bits);  // non-zero byte 수
+    if (seed_hit > 0) {                      // ← trace가 실제로 있을 때만
+      cov_seed_trace = ck_alloc(MAP_SIZE);
+      memcpy(cov_seed_trace, trace_bits, MAP_SIZE);
+    }
+  }
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
@@ -6127,8 +6610,20 @@ havoc_stage:
 
     stage_name  = "havoc";
     stage_short = "havoc";
-    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+    /* Use the remainder budget pre-computed by random_stage so that
+       random + havoc together consume the same total as havoc alone would. */
+    if (random_stage_ran)
+     stage_max = random_stage_havoc_max;
+   else
+     stage_max = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
                   perf_score / havoc_div / 100;
+   
+
+    /* Track union bitmap diversity for +cov imported seeds */
+    if (cov_seed_trace) {
+      havoc_union_map = ck_alloc(MAP_SIZE);
+      memset(havoc_union_map, 0, MAP_SIZE);
+    }
 
   } else {
 
@@ -6143,13 +6638,15 @@ havoc_stage:
 
   }
 
-  if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
-
+  if (stage_max < HAVOC_MIN && !(random_stage_ran && random_stage_havoc_max == 0))
+    stage_max = HAVOC_MIN;
   temp_len = len;
 
   orig_hit_cnt = queued_paths + unique_crashes;
 
   havoc_queued = queued_paths;
+  //SAYF("Havoc stage\nInitial Input: ");
+  //print_buf(out_buf, temp_len);
 
   /* We essentially just do several thousand runs (depending on perf_score)
      where we take the input file and make random stacked tweaks. */
@@ -6537,6 +7034,11 @@ havoc_stage:
     if (common_fuzz_stuff(argv, out_buf, temp_len))
       goto abandon_entry;
 
+    if (havoc_union_map && !child_timed_out && !kill_signal) {
+        u64* um = (u64*)havoc_union_map;
+        u64* tb = (u64*)trace_bits;
+        for (u32 _k = 0; _k < MAP_SIZE / 8; _k++) um[_k] |= tb[_k];
+    }
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
 
@@ -6565,6 +7067,27 @@ havoc_stage:
   if (!splice_cycle) {
     stage_finds[STAGE_HAVOC]  += new_hit_cnt - orig_hit_cnt;
     stage_cycles[STAGE_HAVOC] += stage_max;
+
+    /* Record combined random+havoc coverage diversity for +cov imported seeds */
+    if (cov_seed_trace && havoc_union_map) {
+      u32 random_new = 0, havoc_new = 0, both = 0, random_only = 0, havoc_only = 0;
+      for (u32 _k = 0; _k < MAP_SIZE; _k++) {
+        u8 r = random_union_map && random_union_map[_k] && !cov_seed_trace[_k];
+        u8 h = havoc_union_map[_k] && !cov_seed_trace[_k];
+        if (r) random_new++;
+        if (h) havoc_new++;
+        if (r && h)       both++;
+        else if (r)       random_only++;
+        else if (h)       havoc_only++;
+      }
+      write_stage_cov_stats(queue_cur->fname,
+                             random_new, random_stage_mutations,
+                             havoc_new,  (u32)stage_max,
+                             both, random_only, havoc_only);
+      ck_free(havoc_union_map);  havoc_union_map  = NULL;
+      ck_free(random_union_map); random_union_map = NULL;
+    }
+
   } else {
     stage_finds[STAGE_SPLICE]  += new_hit_cnt - orig_hit_cnt;
     stage_cycles[STAGE_SPLICE] += stage_max;
@@ -6661,12 +7184,252 @@ retry_splicing:
   }
 
 #endif /* !IGNORE_FINDS */
-
+  /*************************
+   * Fine-grained Mutation *
+   *************************/
   ret_val = 0;
+  goto abandon_entry;
+
+random_stage:
+  if (!queue_cur->masking ||
+      queue_cur->num_target_indices == 0 ||
+      UR(100) >= offset_mut_prob ||
+      force_deterministic) {
+    ret_val = 0;
+    goto havoc_stage;
+  }
+
+  if (in_buf != orig_in) {
+    ck_free(in_buf);
+    in_buf = orig_in;
+    len = queue_cur->len;
+  }
+
+  //ck_free(out_buf);
+  out_buf = ck_alloc_nozero(len);
+  memcpy(out_buf, in_buf, len);
+
+  ACTF("Mutating Target: %s",queue_cur->fname);
+  u64 st_time = get_cur_time_us();
+
+  stage_name = "fine-grained";
+  stage_short = "fine-grained";
+
+  /* Split total budget between random_stage and havoc by AFL_RANDOM_STAGE_RATIO.
+     base_budget = budget that havoc alone would get; we divide this by the ratio. */
+  u32 base_budget = (u32)((u64)(doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+                          perf_score / havoc_div / 100);
+  if (base_budget < HAVOC_MIN) base_budget = HAVOC_MIN;
+  stage_max = base_budget * random_stage_ratio / 100;
+  if (stage_max < 1) stage_max = 1;
+  random_stage_havoc_max = base_budget - stage_max;
+  random_stage_ran = 1;
+
+  queue_cur->mutation_cnt += stage_max;
+  temp_len = len;
+
+  /* Union map for coverage diversity (only if we have a seed baseline) */
+  random_union_map = cov_seed_trace ? ck_alloc(MAP_SIZE) : NULL;
+  if (random_union_map) memset(random_union_map, 0, MAP_SIZE);
+
+  u32 temp_mask_bytes = (len + 7) / 8;
+  u8* temp_masking = ck_alloc(temp_mask_bytes);
+  memcpy(temp_masking, queue_cur->masking, temp_mask_bytes);
+  u32* temp_target_index = ck_alloc(sizeof(u32) * queue_cur->num_target_indices);
+  memcpy(temp_target_index, queue_cur->target_index, sizeof(u32) * queue_cur->num_target_indices);
+  u32 num_targets = queue_cur->num_target_indices;
+
+  orig_hit_cnt = queued_paths + unique_crashes;
+
+  u8 mutation_stage;
+  //SAYF("Random stage\nInitial Input: ");
+  //print_buf(out_buf, temp_len);
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+      u32 use_stacking = 1 << (1 + UR(3));
+      stage_cur_val = use_stacking;
+      u8 insert_cnt = 0;
+      for (i = 0; i < use_stacking; i++) {
+        s32 pos = get_modifiable_posn(temp_masking, temp_len, temp_target_index, num_targets);
+        if (pos == temp_len) {
+          /* EOF append */
+          mutation_stage = 2;
+        } else {
+          u32 r = UR(10);
+          if (r < 4)
+            mutation_stage = 0;      // 40%
+          else if (r < 9)
+            mutation_stage = 1;      // 50%
+          else if (insert_cnt < 2)
+            mutation_stage = 2;      // 10%
+          else
+            mutation_stage = UR(2);
+        }
+        switch(mutation_stage) {
+          case 0: {
+            /* Flip a single bit somewhere. Spooky! */
+            FLIP_BIT(out_buf, (pos << 3) + UR(8));
+            break;
+          }
+          case 1: {
+            /* Set a random byte to a random value */
+            out_buf[pos] = UR(256);
+            break;
+          }
+          case 2: {
+            /* Insert random bytes */
+            u32 insert_len = UR(4) + 4;
+            if (temp_len + insert_len >= MAX_FILE)
+              break;
+
+            s32 insert_at = pos;
+            insert_cnt++;
+            u8 skip_insert = 0;
+            for (u32 ti = 0; ti < num_targets; ti++) {
+              if ((u32)insert_at < temp_target_index[ti]) {
+                skip_insert = 1;
+                break;
+              }
+            }
+            if (skip_insert) break;
+
+            if (insert_len > MAX_FILE - temp_len)
+              break;
+
+            u8* new_buf = ck_alloc_nozero(temp_len + insert_len);
+            if(!new_buf)
+              break;
+            
+            if (insert_at > 0)
+              memcpy(new_buf, out_buf, insert_at);
+            for (u32 j = 0; j < insert_len; j++)
+              new_buf[insert_at + j] = UR(255)+1;
+
+            u32 remaining = temp_len - insert_at;
+            if (remaining > 0) {
+              memcpy(new_buf + insert_at + insert_len,
+                     out_buf + insert_at,
+                     remaining);
+            }
+
+            ck_free(out_buf);
+            out_buf = new_buf;
+            
+            for(u32 i=0; i<num_targets; i++) {
+              if(insert_at < temp_target_index[i])
+                temp_target_index[i] += insert_len;
+            }
+
+            u32 new_len = temp_len + insert_len;
+            u32 new_mask_bytes = (new_len + 7) / 8;
+
+            u8* new_masking = ck_alloc(new_mask_bytes);
+            if (!new_masking) {
+              out_buf = NULL;  /* prevent double-free at abandon_entry */
+              ck_free(new_buf);
+              break;
+            }
+            memset(new_masking, 0, new_mask_bytes);
+           
+            for (u32 old_pos = 0; old_pos < temp_len; old_pos++) {
+              if (temp_masking[old_pos / 8] & (1 << (old_pos % 8))) {
+                u32 new_pos = (old_pos < (u32)insert_at)
+                                ? old_pos
+                                : old_pos + insert_len;
+                new_masking[new_pos / 8] |= 1 << (new_pos % 8);
+              }
+            }
+ 
+            ck_free(temp_masking);
+            temp_masking = new_masking;
+            temp_mask_bytes = new_mask_bytes;
+            temp_len = new_len;
+            break;
+          }
+        }
+
+      } /* end for (i = 0; i < use_stacking; i++) */
+
+      if (common_fuzz_stuff_fine_grained(argv, out_buf, temp_len)) {
+        ck_free(temp_masking);
+        ck_free(temp_target_index);
+        ck_free(random_union_map);
+        goto abandon_entry;
+      }
+
+    /* Union this execution's trace into the running coverage bitmap */
+    if (random_union_map && !child_timed_out && !kill_signal) {
+      u64* um = (u64*)random_union_map;
+      u64* tb = (u64*)trace_bits;
+      for (u32 _k = 0; _k < MAP_SIZE / 8; _k++) um[_k] |= tb[_k];
+    }
+
+    /* out_buf might have been mangled a bit, so let's restore it to its
+       original size and shape. */
+      if (temp_len > len) {
+        u32 old_len = len;
+        u32 new_len = temp_len;
+      
+        u32 old_mask_bytes = (old_len + 7) / 8;
+        u32 new_mask_bytes = (new_len + 7) / 8;
+      
+        u8* new_queue_masking = ck_alloc(new_mask_bytes);
+        if (!new_queue_masking) FATAL("OOM expanding masking");
+      
+        memset(new_queue_masking, 0, new_mask_bytes);
+      
+        memcpy(new_queue_masking,
+               queue_cur->masking,
+               old_mask_bytes);
+      
+        ck_free(queue_cur->masking);
+        queue_cur->masking = new_queue_masking;
+        queue_cur->masking_len = new_mask_bytes;
+      }
+      if (temp_len != len) {
+        ck_free(out_buf);
+        out_buf = ck_alloc_nozero(len);
+      }
+      memcpy(out_buf, in_buf, len);
+      temp_len = len;
+      memcpy(temp_target_index, queue_cur->target_index, sizeof(u32) * queue_cur->num_target_indices);    
+      memcpy(temp_masking, queue_cur->masking, temp_mask_bytes);
+      /* If we're finding new stuff, let's run for a bit longer, limits
+       permitting. */
+    }
+    ck_free(temp_masking);
+    ck_free(temp_target_index);
+
+    /* Save random_stage mutation count for combined CSV write in havoc. */
+    if (random_union_map) random_stage_mutations = (u32)stage_max;
+
+    u64 end_time = get_cur_time_us();
+    SAYF("Random stage: %llums\n", (end_time-st_time)/1000);
+    ret_val = 0;
+    goto havoc_stage;
 
 abandon_entry:
 
+  if (tracking_cov_seed) {
+    u64 total_mutants = mutant_hit_cnt + mutant_miss_cnt;
+
+    if (total_mutants > 0)
+      write_mutant_cov_stats(queue_cur->fname,
+                            tracking_cov_idxs, tracking_cov_cnt,
+                            mutant_hit_cnt, mutant_miss_cnt);
+
+    tracking_cov_entry = NULL;
+    mutant_hit_cnt     = 0;
+    mutant_miss_cnt    = 0;
+    tracking_cov_seed  = 0;
+    tracking_cov_idxs  = NULL;
+    tracking_cov_cnt   = 0;
+  }
+
   splicing_with = -1;
+
+  if (cov_seed_trace)  { ck_free(cov_seed_trace);  cov_seed_trace  = NULL; }
+  if (havoc_union_map)  { ck_free(havoc_union_map);  havoc_union_map  = NULL; }
+  if (random_union_map) { ck_free(random_union_map); random_union_map = NULL; }
 
   /* Update pending_not_fuzzed count if we made it through the calibration
      cycle and have not seen this entry before. */
@@ -6704,127 +7467,96 @@ static void sync_fuzzers(char** argv) {
   stage_max = stage_cur = 0;
   cur_depth = 0;
 
-  /* Look at the entries created for every other fuzzer in the sync directory. */
+  /* Two-pass sync: process "driver" first, then everything else. */
+  for (int pass = 0; pass < 2; pass++) {
 
-  while ((sd_ent = readdir(sd))) {
+    rewinddir(sd);
 
-    static u8 stage_tmp[128];
+    /* Look at the entries created for every other fuzzer in the sync directory. */
+    while ((sd_ent = readdir(sd))) {
+      static u8 stage_tmp[128];
+      DIR* qd;
+      struct dirent* qd_ent;
+      u8 *qd_path, *qd_synced_path;
+      u32 min_accept = 0, next_min_accept;
+      s32 id_fd;
 
-    DIR* qd;
-    struct dirent* qd_ent;
-    u8 *qd_path, *qd_synced_path;
-    u32 min_accept = 0, next_min_accept;
+      /* Skip dot files and our own output directory. */
+      if (sd_ent->d_name[0] == '.' || !strcmp(sync_id, sd_ent->d_name)) continue;
 
-    s32 id_fd;
+      /* Pass 0: only process "driver". Pass 1: skip "driver". */
+      int is_driver = !strcmp(sd_ent->d_name, "symcc");
+      if (pass == 0 && !is_driver) continue;
+      if (pass == 1 &&  is_driver) continue;
 
-    /* Skip dot files and our own output directory. */
-
-    if (sd_ent->d_name[0] == '.' || !strcmp(sync_id, sd_ent->d_name)) continue;
-
-    /* Skip anything that doesn't have a queue/ subdirectory. */
-
-    qd_path = alloc_printf("%s/%s/queue", sync_dir, sd_ent->d_name);
-
-    if (!(qd = opendir(qd_path))) {
+      /* Skip anything that doesn't have a queue/ subdirectory. */
+      qd_path = alloc_printf("%s/%s/queue", sync_dir, sd_ent->d_name);
+      if (!(qd = opendir(qd_path))) {
+        ck_free(qd_path);
+        continue;
+      }
+      /* Retrieve the ID of the last seen test case. */
+      qd_synced_path = alloc_printf("%s/.synced/%s", out_dir, sd_ent->d_name);
+      id_fd = open(qd_synced_path, O_RDWR | O_CREAT, 0600);
+      if (id_fd < 0) PFATAL("Unable to create '%s'", qd_synced_path);
+      if (read(id_fd, &min_accept, sizeof(u32)) > 0) 
+        lseek(id_fd, 0, SEEK_SET);
+      next_min_accept = min_accept;
+      /* Show stats */    
+      sprintf(stage_tmp, "sync %u", ++sync_cnt);
+      stage_name = stage_tmp;
+      stage_cur  = 0;
+      stage_max  = 0;
+      /* For every file queued by this fuzzer, parse ID and see if we have looked at
+         it before; exec a test case if not. */
+      while ((qd_ent = readdir(qd))) {
+        u8* path;
+        s32 fd;
+        struct stat st;
+        if (qd_ent->d_name[0] == '.' ||
+            sscanf(qd_ent->d_name, CASE_PREFIX "%06u", &syncing_case) != 1 || 
+            syncing_case < min_accept) continue;
+        /* OK, sounds like a new one. Let's give it a try. */
+        if (syncing_case >= next_min_accept)
+          next_min_accept = syncing_case + 1;
+        path = alloc_printf("%s/%s", qd_path, qd_ent->d_name);
+        /* Allow this to fail in case the other fuzzer is resuming or so... */
+        fd = open(path, O_RDONLY);
+        if (fd < 0) {
+           ck_free(path);
+           continue;
+        }
+        if (fstat(fd, &st)) PFATAL("fstat() failed");
+        /* Ignore zero-sized or oversized files. */
+        if (st.st_size && st.st_size <= MAX_FILE) {
+          u8  fault;
+          u8* mem = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+          if (mem == MAP_FAILED) PFATAL("Unable to mmap '%s'", path);
+          /* See what happens. We rely on save_if_interesting() to catch major
+             errors and save the test case. */
+          write_to_testcase(mem, st.st_size);
+          u32 sync_timeout = MAX(exec_tmout * 5, 1000); 
+          fault = run_target(argv, sync_timeout);
+          if (stop_soon) return;
+          syncing_party = sd_ent->d_name;
+          queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+          syncing_party = 0;
+          munmap(mem, st.st_size);
+          if (!(stage_cur++ % stats_update_freq)) show_stats();
+        }
+        ck_free(path);
+        close(fd);
+      }
+      ck_write(id_fd, &next_min_accept, sizeof(u32), qd_synced_path);
+      close(id_fd);
+      closedir(qd);
       ck_free(qd_path);
-      continue;
+      ck_free(qd_synced_path);
     }
 
-    /* Retrieve the ID of the last seen test case. */
-
-    qd_synced_path = alloc_printf("%s/.synced/%s", out_dir, sd_ent->d_name);
-
-    id_fd = open(qd_synced_path, O_RDWR | O_CREAT, 0600);
-
-    if (id_fd < 0) PFATAL("Unable to create '%s'", qd_synced_path);
-
-    if (read(id_fd, &min_accept, sizeof(u32)) > 0) 
-      lseek(id_fd, 0, SEEK_SET);
-
-    next_min_accept = min_accept;
-
-    /* Show stats */    
-
-    sprintf(stage_tmp, "sync %u", ++sync_cnt);
-    stage_name = stage_tmp;
-    stage_cur  = 0;
-    stage_max  = 0;
-
-    /* For every file queued by this fuzzer, parse ID and see if we have looked at
-       it before; exec a test case if not. */
-
-    while ((qd_ent = readdir(qd))) {
-
-      u8* path;
-      s32 fd;
-      struct stat st;
-
-      if (qd_ent->d_name[0] == '.' ||
-          sscanf(qd_ent->d_name, CASE_PREFIX "%06u", &syncing_case) != 1 || 
-          syncing_case < min_accept) continue;
-
-      /* OK, sounds like a new one. Let's give it a try. */
-
-      if (syncing_case >= next_min_accept)
-        next_min_accept = syncing_case + 1;
-
-      path = alloc_printf("%s/%s", qd_path, qd_ent->d_name);
-
-      /* Allow this to fail in case the other fuzzer is resuming or so... */
-
-      fd = open(path, O_RDONLY);
-
-      if (fd < 0) {
-         ck_free(path);
-         continue;
-      }
-
-      if (fstat(fd, &st)) PFATAL("fstat() failed");
-
-      /* Ignore zero-sized or oversized files. */
-
-      if (st.st_size && st.st_size <= MAX_FILE) {
-
-        u8  fault;
-        u8* mem = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-
-        if (mem == MAP_FAILED) PFATAL("Unable to mmap '%s'", path);
-
-        /* See what happens. We rely on save_if_interesting() to catch major
-           errors and save the test case. */
-
-        write_to_testcase(mem, st.st_size);
-
-        fault = run_target(argv, exec_tmout);
-
-        if (stop_soon) return;
-
-        syncing_party = sd_ent->d_name;
-        queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
-        syncing_party = 0;
-
-        munmap(mem, st.st_size);
-
-        if (!(stage_cur++ % stats_update_freq)) show_stats();
-
-      }
-
-      ck_free(path);
-      close(fd);
-
-    }
-
-    ck_write(id_fd, &next_min_accept, sizeof(u32), qd_synced_path);
-
-    close(id_fd);
-    closedir(qd);
-    ck_free(qd_path);
-    ck_free(qd_synced_path);
-    
-  }  
+  } /* end two-pass loop */
 
   closedir(sd);
-
 }
 
 
@@ -8032,6 +8764,8 @@ int main(int argc, char** argv) {
   check_if_tty();
 
   get_core_count();
+  
+  init_offset_hyperparams();
 
 #ifdef HAVE_AFFINITY
   bind_to_free_cpu();
@@ -8130,7 +8864,11 @@ int main(int argc, char** argv) {
 
     }
 
+    u64 st_time = get_cur_time_us();
     skipped_fuzz = fuzz_one(use_argv);
+    u64 end_time = get_cur_time_us();
+    if((end_time - st_time) / 1000 != 0)
+      SAYF("Fuzz_one time: %llums\n", (end_time-st_time)/1000);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
       

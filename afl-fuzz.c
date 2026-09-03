@@ -90,6 +90,14 @@
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
+static u8   tracking_cov_seed  = 0;       /* 현재 +cov seed를 fuzz 중인가?     */
+static u32* tracking_cov_idxs  = NULL;    /* 추적 중인 bitmap index 목록       */
+static u32  tracking_cov_cnt   = 0;       /* 목록 크기                         */
+static struct queue_entry* tracking_cov_entry = NULL;  /* 추적 중인 entry */
+static u64  mutant_hit_cnt  = 0;
+static u64  mutant_miss_cnt = 0;
+static u64  mutant_hit_cov_cnt  = 0; /* hit이면서 +cov로 저장된 mutant 수 */
+static u64  mutant_miss_cov_cnt = 0; /* miss이면서 +cov로 저장된 mutant 수 */
 
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
@@ -255,6 +263,10 @@ struct queue_entry {
       favored,                        /* Currently favored?               */
       fs_redundant,                   /* Marked as redundant in the fs?   */
       synced;                         /* Sync from other queues?          */
+
+  u8   imported_with_cov;             /* sync import 시 +cov였는가?         */
+  u32* cov_indices;                   /* import 시 새로 열린 bitmap index 목록*/
+  u32  cov_indices_cnt;               /* 위 목록의 크기                      */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
       exec_cksum;                     /* Checksum of the execution trace  */
@@ -881,6 +893,7 @@ EXP_ST void destroy_queue(void) {
     n = q->next;
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    ck_free(q->cov_indices);
     ck_free(q);
     q = n;
 
@@ -3216,6 +3229,96 @@ static void write_crash_readme(void) {
 }
 
 
+static u32* extract_new_cov_indices(u8* virgin_map, u32* cnt) {
+
+  u32  capacity = 64;
+  u32* result   = ck_alloc(sizeof(u32) * capacity);
+  u32  found    = 0;
+
+#ifdef WORD_SIZE_64
+  u64* current = (u64*)trace_bits;
+  u64* virgin  = (u64*)virgin_map;
+  u32  words   = MAP_SIZE >> 3;
+  u32  base    = 0;
+
+  for (u32 w = 0; w < words; w++, base += 8) {
+    if (!current[w] || !(current[w] & virgin[w])) continue;
+
+    u8* cur8 = (u8*)(current + w);
+    u8* vir8 = (u8*)(virgin  + w);
+
+    for (u32 b = 0; b < 8; b++) {
+      if (cur8[b] && vir8[b] == 0xff) {
+        if (found == capacity) {
+          capacity <<= 1;
+          result = ck_realloc(result, sizeof(u32) * capacity);
+        }
+        result[found++] = base + b;
+      }
+    }
+  }
+
+#else
+  u32* current = (u32*)trace_bits;
+  u32* virgin  = (u32*)virgin_map;
+  u32  words   = MAP_SIZE >> 2;
+  u32  base    = 0;
+
+  for (u32 w = 0; w < words; w++, base += 4) {
+    if (!current[w] || !(current[w] & virgin[w])) continue;
+
+    u8* cur8 = (u8*)(current + w);
+    u8* vir8 = (u8*)(virgin  + w);
+
+    for (u32 b = 0; b < 4; b++) {
+      if (cur8[b] && vir8[b] == 0xff) {
+        if (found == capacity) {
+          capacity <<= 1;
+          result = ck_realloc(result, sizeof(u32) * capacity);
+        }
+        result[found++] = base + b;
+      }
+    }
+  }
+#endif
+
+  *cnt = found;
+  if (!found) { ck_free(result); return NULL; }
+  return result;
+
+}
+
+
+/* Log mutant hit/miss stats for a +cov sync-imported seed: how often mutants
+   derived from it, during the fuzzing session just finished, still hit any
+   of the branches it originally brought in (hit_cov/miss_cov), and the
+   overall hit/miss tally across all of its mutants regardless of whether
+   the mutant itself was saved with new coverage (hit/miss). */
+
+static void write_mutant_cov_stats(const u8* seed_fname,
+                                    u64 hit, u64 miss, u64 hit_cov, u64 miss_cov) {
+  u8 csv_path[PATH_MAX];
+  snprintf(csv_path, PATH_MAX, "%s/mutant_cov_stats.csv", out_dir);
+
+  u8 is_new = access((char*)csv_path, F_OK);
+
+  FILE* f = fopen((char*)csv_path, "a");
+  if (!f) return;
+
+  if (is_new)
+    fprintf(f, "elapsed_sec,seed_fname,total_mutants,hit,miss,hit_rate,hit_cov,miss_cov\n");
+
+  u64 elapsed_sec = (get_cur_time() - start_time) / 1000;
+  u64 total = hit + miss;
+  fprintf(f, "%llu,\"%s\",%llu,%llu,%llu,%.4f,%llu,%llu\n",
+    elapsed_sec, seed_fname, total, hit, miss,
+    total ? (double)hit / total : 0.0,
+    hit_cov, miss_cov);
+
+  fclose(f);
+}
+
+
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
@@ -3232,10 +3335,14 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault, u8 sync
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
+    static u8 virgin_snap[MAP_SIZE];
+    if (syncing_party)
+      memcpy(virgin_snap, virgin_bits, MAP_SIZE);
+
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
       return 0;
-    }    
+    }
 
 #ifndef SIMPLE_FILES
 
@@ -3253,6 +3360,26 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault, u8 sync
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
       queued_with_cov++;
+      if (tracking_cov_seed && tracking_cov_idxs && tracking_cov_cnt > 0) {
+        u8 hit = 0;
+        for (u32 i = 0; i < tracking_cov_cnt; i++) {
+          if (trace_bits[tracking_cov_idxs[i]]) { hit = 1; break; }
+        }
+        if (hit) mutant_hit_cov_cnt++;
+        else     mutant_miss_cov_cnt++;
+      }
+
+      if (syncing_party) {
+        if (strncmp((char*)syncing_party, "master", 6) != 0) {
+
+          queue_top->imported_with_cov = 1;
+
+          queue_top->cov_indices = extract_new_cov_indices(virgin_snap,
+                                     &queue_top->cov_indices_cnt);
+
+          SAYF("[+cov import] seed: %s\n", fn);
+        }
+      }
     }
 
     queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
@@ -4755,6 +4882,65 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
 }
 
+EXP_ST u8 common_fuzz_stuff_havoc(char** argv, u8* out_buf, u32 len) {
+
+  u8 fault;
+
+  if (post_handler) {
+
+    out_buf = post_handler(out_buf, &len);
+    if (!out_buf || !len) return 0;
+
+  }
+
+  write_to_testcase(out_buf, len);
+
+  fault = run_target(argv, exec_tmout);
+
+  if (stop_soon) return 1;
+
+  if (fault == FAULT_TMOUT) {
+
+    if (subseq_tmouts++ > TMOUT_LIMIT) {
+      cur_skipped_paths++;
+      return 1;
+    }
+
+  } else subseq_tmouts = 0;
+
+  /* Users can hit us with SIGUSR1 to request the current input
+     to be abandoned. */
+
+  if (skip_requested) {
+
+     skip_requested = 0;
+     cur_skipped_paths++;
+     return 1;
+
+  }
+
+  /* This handles FAULT_ERROR for us: */
+
+  queued_discovered += save_if_interesting(argv, out_buf, len, fault, 0);
+
+  /* ── +cov index hit 판정 ── */
+  if (tracking_cov_seed && tracking_cov_idxs && tracking_cov_cnt > 0) {
+    u8 hit = 0;
+    for (u32 i = 0; i < tracking_cov_cnt; i++) {
+      if (trace_bits[tracking_cov_idxs[i]]) { hit = 1; break; }
+    }
+    if (hit) mutant_hit_cnt++;
+    else     mutant_miss_cnt++;
+  }
+  /* ─────────────────────────── */
+
+  if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
+    show_stats();
+
+  return 0;
+
+}
+
 
 /* Helper to choose random block len for block operations in fuzz_one().
    Doesn't return zero, provided that max_len is > 0. */
@@ -5129,6 +5315,19 @@ static u8 fuzz_one(char** argv) {
   if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
 
   close(fd);
+
+  if (queue_cur->imported_with_cov && queue_cur->cov_indices_cnt > 0) {
+    if (tracking_cov_entry != queue_cur) {
+      tracking_cov_entry = queue_cur;
+      mutant_hit_cnt     = 0;
+      mutant_miss_cnt    = 0;
+    }
+    tracking_cov_seed = 1;
+    tracking_cov_idxs = queue_cur->cov_indices;
+    tracking_cov_cnt  = queue_cur->cov_indices_cnt;
+  }
+  else
+    tracking_cov_seed = 0;
 
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
@@ -6609,7 +6808,7 @@ havoc_stage:
 
     }
 
-    if (common_fuzz_stuff(argv, out_buf, temp_len))
+    if (common_fuzz_stuff_havoc(argv, out_buf, temp_len))
       goto abandon_entry;
 
     /* out_buf might have been mangled a bit, so let's restore it to its
@@ -6740,6 +6939,24 @@ retry_splicing:
   ret_val = 0;
 
 abandon_entry:
+
+  if (tracking_cov_seed) {
+    u64 total_mutants = mutant_hit_cnt + mutant_miss_cnt;
+
+    if (total_mutants > 0)
+      write_mutant_cov_stats(queue_cur->fname,
+                            mutant_hit_cnt, mutant_miss_cnt,
+                            mutant_hit_cov_cnt, mutant_miss_cov_cnt);
+
+    tracking_cov_entry = NULL;
+    mutant_hit_cnt     = 0;
+    mutant_miss_cnt    = 0;
+    mutant_hit_cov_cnt   = 0;
+    mutant_miss_cov_cnt  = 0;
+    tracking_cov_seed  = 0;
+    tracking_cov_idxs  = NULL;
+    tracking_cov_cnt   = 0;
+  }
 
   splicing_with = -1;
 
